@@ -1,0 +1,120 @@
+name: Verify Telegram connection (no sending)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: >-
+      github.event.repository.visibility == 'public' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Check bot identity and destination permissions without sending
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          BOT = "IQ7_bot_bot"
+          TARGET = "@KavehStar"
+
+          class CheckFailed(Exception):
+              pass
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  raise CheckFailed("redirect_blocked")
+
+          def verify(call):
+              me = call("getMe", {})
+              bot_id = me.get("id")
+              if (me.get("is_bot") is not True or type(bot_id) is not int or bot_id <= 0
+                      or str(me.get("username", "")).casefold() != BOT.casefold()):
+                  raise CheckFailed("bot_identity_mismatch")
+              chat = call("getChat", {"chat_id": TARGET})
+              kind = chat.get("type")
+              chat_id = chat.get("id")
+              if (kind not in ("supergroup", "channel") or type(chat_id) is not int
+                      or str(chat.get("username", "")).casefold() != TARGET[1:].casefold()):
+                  raise CheckFailed("destination_mismatch")
+              member = call("getChatMember", {"chat_id": chat_id, "user_id": bot_id})
+              user = member.get("user", {})
+              if not isinstance(user, dict) or user.get("id") != bot_id:
+                  raise CheckFailed("membership_identity_mismatch")
+              status = member.get("status")
+              allowed = status == "creator"
+              if kind == "channel":
+                  allowed = allowed or (status == "administrator" and member.get("can_post_messages") is True)
+              elif status == "administrator":
+                  allowed = True
+              elif status == "member":
+                  permissions = chat.get("permissions", {})
+                  allowed = isinstance(permissions, dict) and permissions.get("can_send_videos") is True
+              elif status == "restricted":
+                  allowed = member.get("is_member") is True and member.get("can_send_videos") is True
+              if not allowed:
+                  raise CheckFailed("video_permission_missing_or_unknown")
+              return kind, status
+
+          def main():
+              stage = "context"
+              try:
+                  if (os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"
+                          or os.environ.get("REPOSITORY_VISIBILITY") != "public"
+                          or not os.environ.get("DEFAULT_BRANCH")
+                          or os.environ.get("GITHUB_REF") != "refs/heads/" + os.environ["DEFAULT_BRANCH"]):
+                      raise CheckFailed("public_default_branch_required")
+                  token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+                  if not token:
+                      raise CheckFailed("telegram_secret_missing")
+                  opener = urllib.request.build_opener(NoRedirect())
+
+                  def call(method, payload):
+                      nonlocal stage
+                      if method not in ("getMe", "getChat", "getChatMember"):
+                          raise CheckFailed("method_not_allowed")
+                      stage = method
+                      request = urllib.request.Request(
+                          "https://api.telegram.org/bot" + token + "/" + method,
+                          data=json.dumps(payload).encode("utf-8"),
+                          headers={"Content-Type": "application/json"}, method="POST")
+                      with opener.open(request, timeout=20) as response:
+                          raw = response.read(262145)
+                      if len(raw) > 262144:
+                          raise CheckFailed("response_too_large")
+                      data = json.loads(raw)
+                      if not isinstance(data, dict) or data.get("ok") is not True or not isinstance(data.get("result"), dict):
+                          raise CheckFailed("api_result_rejected")
+                      return data["result"]
+
+                  kind, status = verify(call)
+                  print("CHECK OK: bot=@IQ7_bot_bot; destination=@KavehStar; type=" + kind
+                        + "; membership=" + status + "; video_allowed=true. No message was sent.")
+                  return 0
+              except CheckFailed as error:
+                  # All CheckFailed values are fixed diagnostics above, never provider text.
+                  print("CHECK FAILED: stage=" + stage + "; reason=" + str(error))
+              except urllib.error.HTTPError as error:
+                  code = error.code if type(error.code) is int and 100 <= error.code <= 599 else 0
+                  print("CHECK FAILED: stage=" + stage + "; reason=http_error; status=" + str(code))
+              except (urllib.error.URLError, TimeoutError, OSError):
+                  print("CHECK FAILED: stage=" + stage + "; reason=network_error")
+              except Exception:
+                  print("CHECK FAILED: stage=" + stage + "; reason=invalid_or_unexpected_response")
+              return 1
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          PY
