@@ -6,6 +6,7 @@ block the queue, because Telegram sendVideo has no idempotency key.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, nullcontext
 import copy
 import hashlib
 import json
@@ -14,9 +15,12 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
+from urllib.parse import urlsplit
 import urllib.request
+import uuid
 
 DESTINATION = "@KavehStar"
 MIN_INTERVAL = 10800
@@ -24,6 +28,13 @@ ROOT = Path(__file__).resolve().parent
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 HASH = re.compile(r"[0-9a-f]{64}\Z")
 IDENTITY_FIELDS = ("episode_id", "story_id", "script_sha256", "video_sha256")
+MAX_VIDEO_BYTES = 49_000_000
+RELEASE_URL = re.compile(
+    r"https://github\.com/kavehkstarai-droid/kstar-story-scheduler/releases/download/"
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,159}\.mp4\Z"
+)
+RELEASE_ASSET_HOST = "release-assets.githubusercontent.com"
+MAX_RECEIPT_BYTES = 65536
 
 
 class Blocked(Exception):
@@ -60,6 +71,114 @@ def safe_caption(value):
     if units > 1024:
         raise Blocked("Telegram caption exceeds 1024 UTF-16 units; revise it before review.")
     return value
+
+
+def validate_media(media):
+    if not isinstance(media, dict):
+        raise Blocked("Invalid media reference.")
+    if set(media) == {"file_id"}:
+        value = media["file_id"]
+        if not isinstance(value, str) or not 1 <= len(value) <= 1024 or re.search(r"\s", value):
+            raise Blocked("Invalid Telegram file_id.")
+    elif set(media) == {"release_url", "size_bytes"}:
+        if not isinstance(media["release_url"], str) or not RELEASE_URL.fullmatch(media["release_url"]):
+            raise Blocked("Only the approved repository's canonical MP4 release URL is allowed.")
+        if not positive_int(media["size_bytes"]) or media["size_bytes"] > MAX_VIDEO_BYTES:
+            raise Blocked("Release video size must be positive and at most 49000000 bytes.")
+    else:
+        raise Blocked("Media must be a Telegram file_id or an approved release URL with exact size_bytes.")
+
+
+def allowed_asset_redirect(url):
+    if not isinstance(url, str) or len(url) > 16384 or any(ord(c) < 33 or ord(c) > 126 for c in url) or "\\" in url:
+        return False
+    try:
+        parsed = urlsplit(url)
+        # A signed query is allowed only on the server-provided asset redirect;
+        # no query is allowed on the URL supplied in queue.json.
+        return (parsed.scheme == "https" and parsed.netloc == RELEASE_ASSET_HOST
+                and not parsed.fragment and parsed.path.startswith("/")
+                and re.fullmatch(r"/[A-Za-z0-9/._-]+", parsed.path) is not None
+                and not any(part in (".", "..") for part in parsed.path.split("/")))
+    except (ValueError, TypeError):
+        return False
+
+
+class ReleaseRedirect(urllib.request.HTTPRedirectHandler):
+    # GitHub documents this host for release assets:
+    # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+    max_redirections = 2
+    max_repeats = 1
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if (req.get_method() != "GET" or code not in (301, 302, 303, 307, 308)
+                or not (RELEASE_URL.fullmatch(req.full_url) or allowed_asset_redirect(req.full_url))
+                or not allowed_asset_redirect(newurl)):
+            raise Blocked("Release download redirect was rejected.")
+        # Never copy Authorization, cookies, or any other request headers to an
+        # asset host. This client has no cookie jar or authentication handlers.
+        return urllib.request.Request(newurl, method="GET")
+
+
+def release_open(request, *, timeout):
+    opener = urllib.request.build_opener(ReleaseRedirect())
+    opener.addheaders = []
+    return opener.open(request, timeout=timeout)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise Blocked("Telegram redirects are not permitted.")
+
+
+def telegram_open(request, *, timeout):
+    return urllib.request.build_opener(NoRedirect()).open(request, timeout=timeout)
+
+
+@contextmanager
+def download_release(episode, *, opener=release_open, temp_root=None):
+    """Yield an exact reviewed MP4 in temporary storage, always cleaning it up."""
+    media = episode["media"]
+    validate_media(media)
+    reviewed_hash = episode.get("video_sha256")
+    if "release_url" not in media or not isinstance(reviewed_hash, str) or not HASH.fullmatch(reviewed_hash):
+        raise Blocked("A release download needs its reviewed video hash.")
+    base = Path(temp_root or os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()).resolve()
+    if base == ROOT.resolve() or ROOT.resolve() in base.parents:
+        raise Blocked("Release downloads must use temporary storage outside the repository.")
+    try:
+        with tempfile.TemporaryDirectory(prefix="kstar-release-", dir=base) as directory:
+            path = Path(directory) / "video.mp4"
+            request = urllib.request.Request(media["release_url"], method="GET")
+            digest, size = hashlib.sha256(), 0
+            with opener(request, timeout=30) as response:
+                final_url = response.geturl()
+                if (response.getcode() != 200
+                        or not (final_url == media["release_url"] or allowed_asset_redirect(final_url))):
+                    raise Blocked("Release download did not return an allowed successful response.")
+                if response.headers.get("Content-Encoding", "identity").lower() != "identity":
+                    raise Blocked("Encoded release download was rejected.")
+                length = response.headers.get("Content-Length")
+                if length is not None and (not re.fullmatch(r"[0-9]+", length) or int(length) != media["size_bytes"]):
+                    raise Blocked("Release download size header does not match the reviewed size.")
+                with path.open("wb") as output:
+                    while True:
+                        chunk = response.read(min(65536, media["size_bytes"] - size + 1))
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > media["size_bytes"] or size > MAX_VIDEO_BYTES:
+                            raise Blocked("Release download exceeded its reviewed size limit.")
+                        digest.update(chunk)
+                        output.write(chunk)
+                if size != media["size_bytes"] or digest.hexdigest() != episode["video_sha256"]:
+                    raise Blocked("Release video does not match its reviewed size and SHA-256.")
+            yield path
+    except Blocked:
+        raise
+    except Exception:
+        # HTTP errors may contain signed redirect URLs. Never expose them.
+        raise Blocked("Release download or temporary-file handling failed; stop and inspect state before retrying.") from None
 
 
 def validate(config, queue, state):
@@ -115,14 +234,7 @@ def validate(config, queue, state):
         if not isinstance(item.get("title"), str) or not item["title"].strip():
             raise Blocked("Every episode needs a title.")
         safe_caption(item.get("telegram_caption"))
-        media = item.get("media", {})
-        if set(media) != {"file_id"}:
-            raise Blocked("Only a preuploaded Telegram file_id is allowed.")
-        value = next(iter(media.values()))
-        if not isinstance(value, str) or not value or len(value) > 4096:
-            raise Blocked("Invalid media reference.")
-        if "file_id" in media and (len(value) > 1024 or re.search(r"\s", value)):
-            raise Blocked("Invalid Telegram file_id.")
+        validate_media(item.get("media"))
         old = sent_by_id.get(item["episode_id"])
         if old:
             if identity(old) != identity(item):
@@ -182,7 +294,7 @@ class GitState:
 
 
 class Telegram:
-    def __init__(self, token, opener=urllib.request.urlopen):
+    def __init__(self, token, opener=telegram_open):
         if not token:
             raise Blocked("TELEGRAM_BOT_TOKEN secret is missing.")
         self._token, self._opener = token, opener
@@ -204,7 +316,49 @@ class Telegram:
             raise Blocked("Telegram outcome is unconfirmed; reservation retained. Reconcile before any further send.") from None
 
 
-def publish(config, queue, state, store, telegram, clock=time.time):
+    def send_file(self, episode, path):
+        """Upload already-reviewed bytes exactly once, without HTTP redirects."""
+        try:
+            with Path(path).open("rb") as source:
+                video = source.read(MAX_VIDEO_BYTES + 1)
+            if (not 0 < len(video) <= MAX_VIDEO_BYTES or len(video) != episode["media"]["size_bytes"]
+                    or hashlib.sha256(video).hexdigest() != episode["video_sha256"]):
+                raise ValueError("Verified download changed before upload")
+            caption = safe_caption(episode.get("telegram_caption"))
+            boundary = "kstar" + uuid.uuid4().hex
+            while boundary.encode() in video or boundary in caption:
+                boundary = "kstar" + uuid.uuid4().hex
+            parts = []
+            for name, value in (("chat_id", DESTINATION), ("caption", caption), ("supports_streaming", "true")):
+                parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n').encode("utf-8"))
+            parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="video"; filename="episode.mp4"\r\n'
+                          'Content-Type: video/mp4\r\n\r\n').encode("ascii"))
+            parts.extend((video, f"\r\n--{boundary}--\r\n".encode("ascii")))
+            request = urllib.request.Request("https://api.telegram.org/bot" + self._token + "/sendVideo",
+                data=b"".join(parts), headers={"Content-Type": "multipart/form-data; boundary=" + boundary}, method="POST")
+            # One POST only. An ambiguous response must never trigger a retry.
+            with self._opener(request, timeout=180) as response:
+                payload = response.read(MAX_RECEIPT_BYTES + 1)
+                if len(payload) > MAX_RECEIPT_BYTES:
+                    raise ValueError("Oversized receipt")
+                data = json.loads(payload)
+            result = data.get("result", {})
+            chat, received_video = result.get("chat", {}), result.get("video", {})
+            file_id = received_video.get("file_id")
+            if (data.get("ok") is not True or not positive_int(result.get("message_id"))
+                    or not positive_int(result.get("date")) or chat.get("type") != "supergroup"
+                    or not isinstance(chat.get("username"), str)
+                    or chat["username"].casefold() != DESTINATION[1:].casefold()
+                    or type(chat.get("id")) is not int or chat["id"] >= 0
+                    or "document" in result or not isinstance(file_id, str)
+                    or not 1 <= len(file_id) <= 1024 or re.search(r"\s", file_id)):
+                raise ValueError("No matching video delivery receipt")
+            return result
+        except Exception:
+            raise Blocked("Telegram upload outcome is unconfirmed; reservation retained. Reconcile before any further send.") from None
+
+
+def publish(config, queue, state, store, telegram, clock=time.time, release_downloader=download_release):
     episodes, sent_by_id = validate(config, queue, state)
     if not config["enabled"]:
         return "disabled"
@@ -218,20 +372,27 @@ def publish(config, queue, state, store, telegram, clock=time.time):
     now = int(clock())
     if state["last_sent_at"] is not None and now - state["last_sent_at"] < MIN_INTERVAL:
         return "too_soon"
-    reference = next_episode["media"]["file_id"]
-    pending = copy.deepcopy(state)
-    pending["dispatching"] = {**identity(next_episode), "reserved_at": now}
-    store.save(pending, "Reserve " + next_episode["episode_id"])
-    # Only a successful durable push permits entering this line.
-    receipt = telegram.send(next_episode, reference)
-    if not positive_int(receipt.get("message_id")):
-        raise Blocked("Telegram receipt is invalid; reservation retained.")
-    completed_at = max(now, int(clock()), receipt.get("date", 0))
-    completed = copy.deepcopy(pending)
-    completed["sent"].append({**identity(next_episode), "message_id": receipt["message_id"], "sent_at": completed_at})
-    completed["last_sent_at"] = completed_at
-    completed["dispatching"] = None
-    store.save(completed, "Record delivery " + next_episode["episode_id"])
+    is_release = "release_url" in next_episode["media"]
+    # Download failures are safe to revisit; no send reservation exists yet.
+    # Disabled, exhausted, unreviewed and cooldown-gated queues never download.
+    with (release_downloader(next_episode) if is_release else nullcontext(None)) as path:
+        pending = copy.deepcopy(state)
+        pending["dispatching"] = {**identity(next_episode), "reserved_at": int(clock())}
+        store.save(pending, "Reserve " + next_episode["episode_id"])
+        # Only a successful durable push permits a Telegram send.
+        receipt = (telegram.send_file(next_episode, path) if is_release
+                   else telegram.send(next_episode, next_episode["media"]["file_id"]))
+        if not positive_int(receipt.get("message_id")):
+            raise Blocked("Telegram receipt is invalid; reservation retained.")
+        completed_at = max(now, int(clock()), receipt.get("date", 0))
+        completed = copy.deepcopy(pending)
+        delivered = {**identity(next_episode), "message_id": receipt["message_id"], "sent_at": completed_at}
+        if is_release:
+            delivered["file_id"] = receipt["video"]["file_id"]
+        completed["sent"].append(delivered)
+        completed["last_sent_at"] = completed_at
+        completed["dispatching"] = None
+        store.save(completed, "Record delivery " + next_episode["episode_id"])
     return "sent"
 
 
